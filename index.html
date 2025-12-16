@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU 3DGS: Geometric Architect (Optimized)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #ui-layer {
+            position: absolute; top: 0; left: 0; padding: 20px;
+            pointer-events: none; width: 360px;
+            display: flex; flex-direction: column; gap: 10px;
+        }
+        #panel {
+            background: rgba(15, 15, 20, 0.95);
+            border: 1px solid #444;
+            padding: 20px;
+            border-radius: 12px;
+            pointer-events: auto;
+            color: #eee;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+            backdrop-filter: blur(10px);
+        }
+        h1 { margin: 0 0 5px 0; font-size: 16px; font-weight: 700; color: #4facfe; letter-spacing: 0.5px; }
+        h2 { margin: 0 0 15px 0; font-size: 11px; color: #888; font-weight: 400; }
+        p { margin: 5px 0; font-size: 12px; color: #ccc; }
+        
+        .btn {
+            background: linear-gradient(135deg, #333 0%, #444 100%);
+            border: 1px solid #555; padding: 12px; color: #fff; font-weight: 600; font-size: 12px;
+            width: 100%; border-radius: 6px; cursor: pointer; margin-top: 10px;
+            transition: all 0.2s; text-align: center;
+        }
+        .btn:hover { border-color: #888; background: #444; }
+        .btn.primary {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            border: none; color: #000;
+        }
+        .btn.primary:hover { filter: brightness(1.1); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(79, 172, 254, 0.4); }
+        .btn.training {
+            background: linear-gradient(135deg, #ff9a9e 0%, #fecfef 99%, #fecfef 100%);
+            color: #444; animation: pulse 1.5s infinite;
+        }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; filter: none; transform: none; }
+
+        input[type="file"] { margin-top: 10px; width: 100%; font-size: 11px; color: #888; }
+        
+        .status-box {
+            margin-top: 15px; background: #000; padding: 10px; border-radius: 4px;
+            font-family: 'Consolas', monospace; font-size: 10px; color: #0f0;
+            white-space: pre-wrap; max-height: 100px; overflow-y: auto; border: 1px solid #333;
+        }
+        .loading-container {
+            width: 100%; height: 4px; background: #222; margin-top: 10px; border-radius: 2px; overflow: hidden;
+        }
+        .loading-bar { width: 0%; height: 100%; background: #4facfe; transition: width 0.1s; }
+
+        @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255, 154, 158, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(255, 154, 158, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 154, 158, 0); } }
+    </style>
+</head>
+<body>
+    <div id="ui-layer">
+        <div id="panel">
+            <h1>WebGPU 3DGS Architect</h1>
+            <h2>SLAM Point Cloud to Gaussian Splatting</h2>
+            
+            <p><strong>Step 1:</strong> Import SLAM Data (.ply)</p>
+            <input type="file" id="fileInput" accept=".ply">
+            <div class="loading-container"><div class="loading-bar" id="progressBar"></div></div>
+            
+            <p style="margin-top:20px;"><strong>Step 2:</strong> Surface Reconstruction</p>
+            <p style="font-size:10px; color:#888;">Optimized Geometric Training with Dynamic Offsets</p>
+            <button id="trainBtn" class="btn primary" disabled>Start Geometric Training</button>
+            
+            <div class="status-box" id="status">System Ready. Waiting for input...</div>
+        </div>
+    </div>
+    <canvas id="canvas"></canvas>
+
+    <script type="module">
+        const WORKGROUP_SIZE = 256;
+
+        // ==============================================
+        // Shader 1: Geometric Trainer (Iterative Plane Fitting)
+        // ==============================================
+        const trainShaderSource = `
+        struct Uniforms {
+            viewMatrix: mat4x4<f32>, projMatrix: mat4x4<f32>,
+            width: f32, height: f32, numGaussians: u32, paddedCount: u32,
+            trainIter: u32, pad: u32,
+        };
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+        struct Gaussian { pos: vec4<f32>, scale: vec4<f32>, rot: vec4<f32>, color: vec4<f32> };
+        @group(0) @binding(1) var<storage, read_write> gaussians: array<Gaussian>;
+
+        fn rand(co: vec2<f32>) -> f32 { return fract(sin(dot(co, vec2<f32>(12.9898, 78.233))) * 43758.5453); }
+
+        fn getNormalFromQuat(q: vec4<f32>) -> vec3<f32> {
+            return vec3<f32>(
+                2.0 * (q.x * q.z + q.y * q.w),
+                2.0 * (q.y * q.z - q.x * q.w),
+                1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+            );
+        }
+
+        fn rotationFromTo(fromVec: vec3<f32>, toVec: vec3<f32>) -> vec4<f32> {
+            let axis = cross(fromVec, toVec);
+            let d = dot(fromVec, toVec);
+            let s = sqrt((1.0 + d) * 2.0);
+            if (s <= 0.00001) { return vec4<f32>(0.,0.,0.,1.); } // Safety check
+            let invs = 1.0 / s;
+            return normalize(vec4<f32>(axis * invs, s * 0.5));
+        }
+
+        @compute @workgroup_size(${WORKGROUP_SIZE})
+        fn trainStep(@builtin(global_invocation_id) global_id: vec3<u32>) {
+            let idx = global_id.x;
+            if (idx >= uniforms.numGaussians) { return; }
+
+            var g = gaussians[idx];
+            let pos = g.pos.xyz;
+            let iter = f32(uniforms.trainIter);
+
+            let seed = vec2<f32>(f32(idx) * 0.123, iter * 0.456);
+            let searchIdx = u32(rand(seed) * f32(uniforms.numGaussians));
+            
+            if (searchIdx != idx && searchIdx < uniforms.numGaussians) {
+                let neighbor = gaussians[searchIdx];
+                let diff = neighbor.pos.xyz - pos;
+                let distSq = dot(diff, diff);
+                
+                // SLAM scale check (0.5m radius)
+                if (distSq < 0.25 && distSq > 0.00001) {
+                    let colorDiff = distance(g.color.rgb, neighbor.color.rgb);
+                    let weight = max(0.0, 1.0 - colorDiff * 3.0); 
+
+                    if (weight > 0.01) {
+                        let dist = sqrt(distSq);
+                        let dir = normalize(diff);
+                        let currentNormal = getNormalFromQuat(g.rot);
+                        let alignment = dot(currentNormal, dir);
+                        
+                        let lr_rot = 0.05 * weight;
+                        let lr_scale = 0.02 * weight;
+
+                        // Rotation: Nudge normal away from neighbor direction (to make it a plane)
+                        let targetNormal = normalize(currentNormal - dir * alignment * 0.5);
+                        // Check NaN
+                        if (length(targetNormal) > 0.001) {
+                            let deltaRot = rotationFromTo(currentNormal, targetNormal);
+                            let q1 = deltaRot; let q2 = g.rot;
+                            g.rot = normalize(vec4<f32>(
+                                q1.w*q2.x + q1.x*q2.w + q1.y*q2.z - q1.z*q2.y,
+                                q1.w*q2.y - q1.x*q2.z + q1.y*q2.w + q1.z*q2.x,
+                                q1.w*q2.z + q1.x*q2.y - q1.y*q2.x + q1.z*q2.w,
+                                q1.w*q2.w - q1.x*q2.x - q1.y*q2.y - q1.z*q2.z
+                            ));
+                        }
+
+                        // Scale: Flatten or expand
+                        let planarFactor = 1.0 - abs(alignment);
+                        if (planarFactor > 0.5) {
+                            let targetScaleXY = clamp(dist * 0.8, 0.01, 0.5);
+                            g.scale.x = mix(g.scale.x, targetScaleXY, lr_scale);
+                            g.scale.y = mix(g.scale.y, targetScaleXY, lr_scale);
+                            g.scale.z = mix(g.scale.z, 0.005, lr_scale * 0.5); // Thin
+                        } else {
+                            g.scale.z = mix(g.scale.z, dist * 0.5, lr_scale * 0.1);
+                        }
+                        
+                        g.pos.w = min(g.pos.w + 0.002 * weight, 1.0);
+                    }
+                }
+            }
+            gaussians[idx] = g;
+        }
+        `;
+
+        // ==============================================
+        // Shader 2: Sorter & Renderer (Optimized)
+        // ==============================================
+        const sortShaderSource = `
+        struct Uniforms { viewMatrix: mat4x4<f32>, projMatrix: mat4x4<f32>, width: f32, height: f32, numGaussians: u32, paddedCount: u32, trainIter: u32, pad: u32 };
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+        struct Gaussian { pos: vec4<f32>, scale: vec4<f32>, rot: vec4<f32>, color: vec4<f32> };
+        @group(0) @binding(1) var<storage, read> gaussians: array<Gaussian>;
+        @group(0) @binding(2) var<storage, read_write> sortKeys: array<f32>;
+        @group(0) @binding(3) var<storage, read_write> sortIndices: array<u32>;
+
+        @compute @workgroup_size(${WORKGROUP_SIZE})
+        fn preprocess(@builtin(global_invocation_id) global_id: vec3<u32>) {
+            let idx = global_id.x;
+            if (idx >= uniforms.paddedCount) { return; }
+            if (idx >= uniforms.numGaussians) { sortKeys[idx] = -9999999.0; sortIndices[idx] = idx; return; }
+            let g = gaussians[idx];
+            let pos = vec4<f32>(g.pos.xyz, 1.0);
+            let viewPos = uniforms.viewMatrix * pos;
+            sortKeys[idx] = viewPos.z; sortIndices[idx] = idx;
+        }
+
+        struct SortParams { j: u32, k: u32 };
+        @group(0) @binding(4) var<uniform> params: SortParams;
+
+        @compute @workgroup_size(${WORKGROUP_SIZE})
+        fn bitonicSort(@builtin(global_invocation_id) global_id: vec3<u32>) {
+            let i = global_id.x;
+            if (i >= uniforms.paddedCount) { return; }
+            let j = params.j; let k = params.k; let ixj = i ^ j;
+            if (ixj > i && ixj < uniforms.paddedCount) {
+                let key_i = sortKeys[i]; let key_ixj = sortKeys[ixj];
+                let dir = (i & k) == 0u;
+                // Back-to-Front Logic (ViewZ is negative forward usually, but here we assume standard)
+                if ((key_i > key_ixj) == dir) {
+                    sortKeys[i] = key_ixj; sortKeys[ixj] = key_i;
+                    let tempIdx = sortIndices[i]; sortIndices[i] = sortIndices[ixj]; sortIndices[ixj] = tempIdx;
+                }
+            }
+        }
+        `;
+
+        const renderShaderSource = `
+        struct Uniforms { viewMatrix: mat4x4<f32>, projMatrix: mat4x4<f32>, width: f32, height: f32, numGaussians: u32, paddedCount: u32 };
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+        struct Gaussian { pos: vec4<f32>, scale: vec4<f32>, rot: vec4<f32>, color: vec4<f32> };
+        @group(0) @binding(1) var<storage, read> gaussians: array<Gaussian>;
+        @group(0) @binding(3) var<storage, read> sortIndices: array<u32>;
+        struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) color: vec4<f32>, @location(1) uv: vec2<f32>, @location(2) conic: vec3<f32> };
+        
+        fn quatToMat3(q: vec4<f32>) -> mat3x3<f32> {
+            let r = q.x; let x = q.y; let y = q.z; let z = q.w;
+            return mat3x3<f32>(1.0-2.0*(y*y+z*z), 2.0*(x*y-r*z), 2.0*(x*z+r*y), 2.0*(x*y+r*z), 1.0-2.0*(x*x+z*z), 2.0*(y*z-r*x), 2.0*(x*z-r*y), 2.0*(y*z+r*x), 1.0-2.0*(x*x+y*y));
+        }
+        
+        @vertex
+        fn vs_main(@builtin(vertex_index) v_index: u32, @builtin(instance_index) i_index: u32) -> VertexOutput {
+            var out: VertexOutput;
+            if (i_index >= uniforms.numGaussians) { out.position = vec4<f32>(0.0); return out; }
+            let g = gaussians[sortIndices[i_index]];
+            let center = vec4<f32>(g.pos.xyz, 1.0);
+            let viewPos = uniforms.viewMatrix * center;
+            // Near clipping
+            if (viewPos.z > 0.1) { out.position = vec4<f32>(0.0,0.0,2.0,1.0); return out; }
+            
+            let R = quatToMat3(g.rot);
+            let S = mat3x3<f32>(g.scale.x,0.,0., 0.,g.scale.y,0., 0.,0.,g.scale.z);
+            let M = R * S; let Sigma = M * transpose(M);
+            let W = mat3x3<f32>(uniforms.viewMatrix[0].xyz, uniforms.viewMatrix[1].xyz, uniforms.viewMatrix[2].xyz);
+            let Sigma_view = W * Sigma * transpose(W);
+            let f = uniforms.projMatrix[0][0] * uniforms.width * 0.5;
+            let f_z = f / viewPos.z; let txtz = f_z * f_z;
+            let cov2d_00 = Sigma_view[0][0] * txtz; let cov2d_01 = Sigma_view[0][1] * txtz; let cov2d_11 = Sigma_view[1][1] * txtz;
+            let det = cov2d_00 * cov2d_11 - cov2d_01 * cov2d_01;
+            if (det <= 0.000001) { out.position = vec4<f32>(0.0,0.0,2.0,1.0); return out; }
+            let det_inv = 1.0 / det;
+            out.conic = vec3<f32>(cov2d_11 * det_inv, -cov2d_01 * det_inv, cov2d_00 * det_inv);
+            let mid = 0.5 * (cov2d_00 + cov2d_11);
+            let lambda1 = mid + sqrt(max(0.1, mid*mid - det)); let lambda2 = mid - sqrt(max(0.1, mid*mid - det));
+            let radius = ceil(3.0 * sqrt(max(lambda1, lambda2)));
+            var offset = vec2<f32>(0.0);
+            if (v_index==0u){offset=vec2<f32>(-1.,-1.);}else if(v_index==1u){offset=vec2<f32>(1.,-1.);}else if(v_index==2u){offset=vec2<f32>(-1.,1.);}else{offset=vec2<f32>(1.,1.);}
+            out.uv = offset * radius;
+            let ndcCenter = (uniforms.projMatrix * viewPos);
+            out.position = ndcCenter + vec4<f32>(offset * radius * 2.0 / vec2<f32>(uniforms.width, uniforms.height), 0.0, 0.0) * ndcCenter.w;
+            out.color = vec4<f32>(g.color.rgb, g.pos.w);
+            return out;
+        }
+        @fragment
+        fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+            let u = in.uv.x; let v = in.uv.y;
+            let power = -0.5 * (in.conic.x*u*u + 2.0*in.conic.y*u*v + in.conic.z*v*v);
+            if (power > 0.0) { discard; }
+            let alpha = min(0.99, in.color.a * exp(power));
+            if (alpha < 0.004) { discard; }
+            // Premultiplied alpha output
+            return vec4<f32>(in.color.rgb * alpha, alpha);
+        }
+        `;
+
+        // --- Main System ---
+        let device, context;
+        let buffers = {};
+        let pipelines = {};
+        let bindGroups = {};
+        let numGaussians = 0;
+        let paddedCount = 0;
+        let isReady = false;
+        let isTraining = false;
+        let trainIter = 0;
+        let deviceLimits = {};
+        
+        // Dynamic Offset Buffer for Sort Params
+        // Must match minUniformBufferOffsetAlignment (usually 256 bytes)
+        const SORT_PARAMS_ALIGNMENT = 256;
+        let sortStepsCount = 0;
+
+        const ui = {
+            status: document.getElementById('status'),
+            bar: document.getElementById('progressBar'),
+            canvas: document.getElementById('canvas'),
+            trainBtn: document.getElementById('trainBtn')
+        };
+
+        const camera = { pos: [0, 0, 3], target: [0, 0, 0], up: [0, 1, 0], yaw: 0, pitch: 0, dist: 3, drag: false, lx: 0, ly: 0 };
+        
+        // Matrix Helpers
+        const Mat4 = {
+            create: () => new Float32Array(16),
+            perspective: (out, fov, asp, near, far) => {
+                const f = 1.0 / Math.tan(fov / 2), nf = 1 / (near - far);
+                out.fill(0); out[0] = f / asp; out[5] = f; out[10] = (far + near) * nf; out[11] = -1; out[14] = (2 * far * near) * nf;
+            },
+            lookAt: (out, eye, center, up) => {
+                let z0 = eye[0]-center[0], z1 = eye[1]-center[1], z2 = eye[2]-center[2];
+                let len = 1/Math.hypot(z0,z1,z2); z0*=len; z1*=len; z2*=len;
+                let x0 = up[1]*z2 - up[2]*z1, x1 = up[2]*z0 - up[0]*z2, x2 = up[0]*z1 - up[1]*z0;
+                len = Math.hypot(x0,x1,x2); if(!len) len=1; len=1/len; x0*=len; x1*=len; x2*=len;
+                let y0 = z1*x2 - z2*x1, y1 = z2*x0 - z0*x2, y2 = z0*x1 - z1*x0;
+                out[0]=x0; out[1]=y0; out[2]=z0; out[3]=0; out[4]=x1; out[5]=y1; out[6]=z1; out[7]=0; out[8]=x2; out[9]=y2; out[10]=z2; out[11]=0;
+                out[12]=-(x0*eye[0]+x1*eye[1]+x2*eye[2]); out[13]=-(y0*eye[0]+y1*eye[1]+y2*eye[2]); out[14]=-(z0*eye[0]+z1*eye[1]+z2*eye[2]); out[15]=1;
+            }
+        };
+
+        async function init() {
+            try {
+                if (!navigator.gpu) throw new Error("WebGPU not supported.");
+                const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+                if (!adapter) throw new Error("No GPU adapter found.");
+                
+                const limits = adapter.limits;
+                deviceLimits = { maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize, maxBufferSize: limits.maxBufferSize };
+                
+                // Request Max Limits
+                device = await adapter.requestDevice({ 
+                    requiredLimits: { 
+                        maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize, 
+                        maxBufferSize: limits.maxBufferSize,
+                        maxComputeWorkgroupStorageSize: limits.maxComputeWorkgroupStorageSize
+                    } 
+                });
+                
+                context = ui.canvas.getContext('webgpu');
+                context.configure({ device, format: navigator.gpu.getPreferredCanvasFormat(), alphaMode: 'premultiplied' });
+                
+                ui.status.innerText = `GPU Initialized.\nMax Buffer: ${(deviceLimits.maxStorageBufferBindingSize/1024/1024).toFixed(0)}MB`;
+                
+                const createPipe = (code, ent, type='compute', layout=null) => {
+                    const module = device.createShaderModule({ code });
+                    if(type==='compute') return device.createComputePipeline({ layout: layout || 'auto', compute:{module, entryPoint:ent} });
+                    return device.createRenderPipeline({
+                        layout:'auto', vertex:{module, entryPoint:'vs_main'},
+                        fragment:{module, entryPoint:'fs_main', targets:[{format:navigator.gpu.getPreferredCanvasFormat(), blend:{color:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},
+                        primitive:{topology:'triangle-strip', stripIndexFormat:undefined}
+                    });
+                };
+
+                // Create Pipelines
+                pipelines.preprocess = createPipe(sortShaderSource, 'preprocess');
+                pipelines.train = createPipe(trainShaderSource, 'trainStep');
+                pipelines.render = createPipe(renderShaderSource, 'vs_main', 'render');
+
+                // Explicit Layout for Sort to allow Dynamic Offsets
+                const sortBindGroupLayout = device.createBindGroupLayout({
+                    entries: [
+                        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+                        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', hasDynamicOffset: true } } // Key: Dynamic Offset
+                    ]
+                });
+                const sortPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [sortBindGroupLayout] });
+                pipelines.sort = device.createComputePipeline({
+                    layout: sortPipelineLayout,
+                    compute: { module: device.createShaderModule({ code: sortShaderSource }), entryPoint: 'bitonicSort' }
+                });
+                pipelines.sortLayout = sortBindGroupLayout; // Save for bindgroup creation
+
+            } catch (e) { ui.status.innerText = `Init Error: ${e.message}`; ui.status.style.color='#f00'; }
+        }
+
+        async function loadPLY(file) {
+            isReady = false; isTraining = false; trainIter = 0;
+            ui.trainBtn.disabled = true; ui.trainBtn.classList.remove('training');
+            ui.trainBtn.innerText = "Start Geometric Training";
+            ui.bar.style.width = '10%'; ui.status.innerText = "Reading file...";
+
+            try {
+                const chunk = await file.slice(0, 4096).text();
+                const endHeaderMatch = chunk.match(/end_header\s*\n/);
+                if (!endHeaderMatch) throw new Error("Invalid PLY header");
+                const headerSize = endHeaderMatch.index + endHeaderMatch[0].length;
+                const header = chunk.substring(0, endHeaderMatch.index);
+                const isBinary = chunk.includes("binary_little_endian");
+                
+                let vertexCount = 0;
+                let props = [];
+                const typeSizes = { char:1, uchar:1, short:2, ushort:2, int:4, uint:4, float:4, double:8, float32:4 };
+                header.split('\n').forEach(line => {
+                    line=line.trim();
+                    if(line.startsWith("element vertex")) vertexCount = parseInt(line.split(/\s+/)[2]);
+                    if(line.startsWith("property")) {
+                        const p = line.split(/\s+/);
+                        props.push({ name:p[2], type:p[1], size:typeSizes[p[1]]||4, offset:0 });
+                    }
+                });
+
+                // Downsample
+                const structSize = 64; 
+                const totalBytes = vertexCount * structSize;
+                let skipStep = 1; 
+                if (totalBytes > deviceLimits.maxStorageBufferBindingSize * 0.9) {
+                    skipStep = Math.ceil(totalBytes / (deviceLimits.maxStorageBufferBindingSize * 0.9));
+                    ui.status.innerText += `\nLarge file. Downsampling 1/${skipStep}...`;
+                }
+                const loadCount = Math.floor(vertexCount / skipStep);
+                numGaussians = loadCount;
+                paddedCount = 1; while (paddedCount < numGaussians) paddedCount <<= 1;
+
+                ui.status.innerText += `\nVertices: ${loadCount}`;
+                ui.bar.style.width = '30%';
+
+                const pMap = {}; props.forEach((p,i)=>{pMap[p.name]={...p,index:i}});
+                const getP = (n) => pMap[n];
+                const gpuData = new Float32Array(paddedCount * 16);
+                
+                const hasRGB = getP('red');
+                const hasScale = getP('scale_0');
+                
+                let loadedIdx = 0;
+                if (isBinary) {
+                    let stride = 0; props.forEach(p => { p.offset = stride; stride += p.size; });
+                    const buffer = await file.slice(headerSize).arrayBuffer();
+                    const view = new DataView(buffer);
+                    for(let i=0; i<vertexCount; i+=skipStep) {
+                        if(loadedIdx>=loadCount) break;
+                        const base = i*stride; const gb = loadedIdx*16;
+                        gpuData[gb+0] = view.getFloat32(base + getP('x').offset, true);
+                        gpuData[gb+1] = view.getFloat32(base + getP('y').offset, true);
+                        gpuData[gb+2] = view.getFloat32(base + getP('z').offset, true);
+                        gpuData[gb+3] = 0.5; // Low opacity
+                        
+                        const s = hasScale ? Math.exp(view.getFloat32(base+getP('scale_0').offset,true)) : 0.01;
+                        gpuData[gb+4]=s; gpuData[gb+5]=s; gpuData[gb+6]=s;
+                        gpuData[gb+8]=1.0; 
+                        
+                        if(hasRGB) {
+                            gpuData[gb+12] = view.getUint8(base+getP('red').offset)/255.0;
+                            gpuData[gb+13] = view.getUint8(base+getP('green').offset)/255.0;
+                            gpuData[gb+14] = view.getUint8(base+getP('blue').offset)/255.0;
+                        } else { gpuData[gb+12]=0.8; gpuData[gb+13]=0.8; gpuData[gb+14]=0.8; }
+                        gpuData[gb+15]=1.0;
+                        loadedIdx++;
+                        if(loadedIdx%100000===0) { ui.bar.style.width = `${30 + (i/vertexCount)*60}%`; await new Promise(r=>setTimeout(r,0)); }
+                    }
+                } else {
+                    // ASCII
+                    const text = await file.text();
+                    const lines = text.substring(headerSize).split('\n');
+                    let rawIdx = 0;
+                    for(let line of lines) {
+                        line=line.trim(); if(!line) continue;
+                        if(rawIdx%skipStep!==0) { rawIdx++; continue; }
+                        if(loadedIdx>=loadCount) break;
+                        const parts = line.split(/\s+/);
+                        const gb = loadedIdx*16;
+                        gpuData[gb+0]=parseFloat(parts[getP('x').index]);
+                        gpuData[gb+1]=parseFloat(parts[getP('y').index]);
+                        gpuData[gb+2]=parseFloat(parts[getP('z').index]);
+                        gpuData[gb+3]=0.5;
+                        gpuData[gb+4]=0.01; gpuData[gb+5]=0.01; gpuData[gb+6]=0.01;
+                        gpuData[gb+8]=1.0;
+                        if(hasRGB) {
+                            gpuData[gb+12]=parseFloat(parts[getP('red').index])/255;
+                            gpuData[gb+13]=parseFloat(parts[getP('green').index])/255;
+                            gpuData[gb+14]=parseFloat(parts[getP('blue').index])/255;
+                        } else { gpuData[gb+12]=0.8; gpuData[gb+13]=0.8; gpuData[gb+14]=0.8; }
+                        loadedIdx++; rawIdx++;
+                    }
+                }
+
+                ui.bar.style.width = '100%';
+                setupGPU(gpuData);
+            } catch (err) { console.error(err); ui.status.innerText = `Load Error: ${err.message}`; ui.status.style.color='#f00'; }
+        }
+
+        function setupGPU(data) {
+            ui.status.innerText = "Uploading buffers...";
+            buffers.gaussians = device.createBuffer({ size:data.byteLength, usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST, mappedAtCreation:true });
+            new Float32Array(buffers.gaussians.getMappedRange()).set(data);
+            buffers.gaussians.unmap();
+
+            buffers.sortKeys = device.createBuffer({ size:paddedCount*4, usage:GPUBufferUsage.STORAGE });
+            buffers.sortIndices = device.createBuffer({ size:paddedCount*4, usage:GPUBufferUsage.STORAGE });
+            buffers.uniforms = device.createBuffer({ size:256, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST });
+
+            // --- Pre-calculate Sort Params for Dynamic Offsets ---
+            // Calculate max steps
+            sortStepsCount = 0;
+            for(let k=2; k<=paddedCount; k<<=1) { for(let j=k>>1; j>0; j>>=1) { sortStepsCount++; } }
+            
+            // Create a large buffer for all sort steps (aligned to 256 bytes)
+            const sortParamsBufferSize = sortStepsCount * SORT_PARAMS_ALIGNMENT;
+            buffers.sortParams = device.createBuffer({ size: sortParamsBufferSize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, mappedAtCreation: true });
+            
+            const paramsView = new Uint32Array(buffers.sortParams.getMappedRange());
+            let stepIndex = 0;
+            for(let k=2; k<=paddedCount; k<<=1) {
+                for(let j=k>>1; j>0; j>>=1) {
+                    // Write J and K at the beginning of each 256-byte block
+                    // Uint32 index = byteIndex / 4
+                    const index = (stepIndex * SORT_PARAMS_ALIGNMENT) / 4;
+                    paramsView[index] = j;
+                    paramsView[index + 1] = k;
+                    stepIndex++;
+                }
+            }
+            buffers.sortParams.unmap();
+
+            // Bind Groups
+            const common = [ { binding:0, resource:{buffer:buffers.uniforms} }, { binding:1, resource:{buffer:buffers.gaussians} }, { binding:2, resource:{buffer:buffers.sortKeys} }, { binding:3, resource:{buffer:buffers.sortIndices} } ];
+
+            bindGroups.preprocess = device.createBindGroup({ layout:pipelines.preprocess.getBindGroupLayout(0), entries:common });
+            bindGroups.train = device.createBindGroup({ layout:pipelines.train.getBindGroupLayout(0), entries:[{binding:0, resource:{buffer:buffers.uniforms}}, {binding:1, resource:{buffer:buffers.gaussians}}] });
+            bindGroups.render = device.createBindGroup({ layout:pipelines.render.getBindGroupLayout(0), entries:[{binding:0, resource:{buffer:buffers.uniforms}}, {binding:1, resource:{buffer:buffers.gaussians}}, {binding:3, resource:{buffer:buffers.sortIndices}}] });
+
+            // Sort BindGroup (special case for dynamic offset)
+            // Note: We bind the whole buffer, but only a small window (sizeof SortParams) is visible per dispatch
+            bindGroups.sort = device.createBindGroup({
+                layout: pipelines.sortLayout,
+                entries: [
+                    { binding: 0, resource: { buffer: buffers.uniforms } },
+                    { binding: 1, resource: { buffer: buffers.gaussians } },
+                    { binding: 2, resource: { buffer: buffers.sortKeys } },
+                    { binding: 3, resource: { buffer: buffers.sortIndices } },
+                    { binding: 4, resource: { buffer: buffers.sortParams, size: 16 } } // Only map 16 bytes (2 uints + pad) visible
+                ]
+            });
+
+            ui.status.innerText = `Import Complete.\nPoints: ${numGaussians}\nReady to reconstruct surface.`;
+            ui.trainBtn.disabled = false; ui.bar.style.display = 'none';
+            isReady = true;
+            requestAnimationFrame(frame);
+        }
+
+        ui.trainBtn.addEventListener('click', () => {
+            isTraining = !isTraining;
+            if(isTraining) { ui.trainBtn.classList.add('training'); ui.trainBtn.innerText = "Reconstructing Surface... (Stop)"; } 
+            else { ui.trainBtn.classList.remove('training'); ui.trainBtn.innerText = "Resume Geometric Training"; }
+        });
+
+        // Resize
+        window.addEventListener('resize', () => {
+            if(!device) return;
+            const w = window.innerWidth; const h = window.innerHeight;
+            canvas.width = w; canvas.height = h;
+            context.configure({ device, format: navigator.gpu.getPreferredCanvasFormat(), alphaMode: 'premultiplied' });
+        });
+
+        function frame() {
+            if(!isReady) return;
+            const aspect = ui.canvas.width/ui.canvas.height;
+            const view = Mat4.create(); const proj = Mat4.create();
+            const x = camera.dist*Math.sin(camera.yaw)*Math.cos(camera.pitch);
+            const y = camera.dist*Math.sin(camera.pitch);
+            const z = camera.dist*Math.cos(camera.yaw)*Math.cos(camera.pitch);
+            Mat4.lookAt(view, [x,y,z], camera.target, camera.up);
+            Mat4.perspective(proj, 1.0, aspect, 0.1, 100.0);
+            
+            const uArr = new Float32Array(32); uArr.set(view,0); uArr.set(proj,16);
+            device.queue.writeBuffer(buffers.uniforms, 0, uArr);
+            device.queue.writeBuffer(buffers.uniforms, 128, new Float32Array([ui.canvas.width, ui.canvas.height]));
+            device.queue.writeBuffer(buffers.uniforms, 136, new Uint32Array([numGaussians, paddedCount, trainIter, 0]));
+
+            const cmd = device.createCommandEncoder();
+
+            // 1. Train
+            if(isTraining) {
+                const pTrain = cmd.beginComputePass();
+                pTrain.setPipeline(pipelines.train); pTrain.setBindGroup(0, bindGroups.train);
+                pTrain.dispatchWorkgroups(Math.ceil(numGaussians/WORKGROUP_SIZE));
+                pTrain.end();
+                trainIter++;
+                if(trainIter%20===0) ui.status.innerText = `Training Iter: ${trainIter}\nRefining Surface...`;
+            }
+
+            // 2. Sort Preprocess
+            const pPre = cmd.beginComputePass();
+            pPre.setPipeline(pipelines.preprocess); pPre.setBindGroup(0, bindGroups.preprocess);
+            pPre.dispatchWorkgroups(Math.ceil(paddedCount/WORKGROUP_SIZE));
+            pPre.end();
+
+            // 3. Bitonic Sort (Single Pass via Dynamic Offsets)
+            const pSort = cmd.beginComputePass();
+            pSort.setPipeline(pipelines.sort);
+            let stepIndex = 0;
+            for(let k=2; k<=paddedCount; k<<=1) {
+                for(let j=k>>1; j>0; j>>=1) {
+                    // Apply dynamic offset to pick correct J/K
+                    const offset = stepIndex * SORT_PARAMS_ALIGNMENT;
+                    pSort.setBindGroup(0, bindGroups.sort, [offset]); 
+                    pSort.dispatchWorkgroups(Math.ceil(paddedCount/WORKGROUP_SIZE));
+                    stepIndex++;
+                }
+            }
+            pSort.end();
+
+            // 4. Render
+            const pRen = cmd.beginRenderPass({ colorAttachments:[{view:context.getCurrentTexture().createView(), clearValue:{r:0,g:0,b:0,a:1}, loadOp:'clear', storeOp:'store'}] });
+            pRen.setPipeline(pipelines.render); pRen.setBindGroup(0, bindGroups.render);
+            pRen.draw(4, numGaussians, 0, 0);
+            pRen.end();
+
+            device.queue.submit([cmd.finish()]);
+            requestAnimationFrame(frame);
+        }
+
+        document.getElementById('fileInput').addEventListener('change', e=>{if(e.target.files[0])loadPLY(e.target.files[0])});
+        ui.canvas.addEventListener('mousedown', e=>{camera.drag=true; camera.lx=e.clientX; camera.ly=e.clientY});
+        window.addEventListener('mouseup', ()=>camera.drag=false);
+        ui.canvas.addEventListener('mousemove', e=>{if(!camera.drag)return; camera.yaw-=(e.clientX-camera.lx)*0.005; camera.pitch+=(e.clientY-camera.ly)*0.005; camera.lx=e.clientX; camera.ly=e.clientY});
+        ui.canvas.addEventListener('wheel', e=>{camera.dist*=(1+e.deltaY*0.001);e.preventDefault()},{passive:false});
+
+        init();
+    </script>
+</body>
+</html>
