@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebGPU 3DGS: Geometric Architect (Optimized)</title>
+    <title>WebGPU 3DGS: Geometric Architect (Fixed NaN)</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Segoe UI', sans-serif; }
         canvas { display: block; width: 100vw; height: 100vh; }
@@ -119,6 +119,9 @@
             if (idx >= uniforms.numGaussians) { return; }
 
             var g = gaussians[idx];
+            // NaN check inside shader: if scale is zero (marked as invalid), skip
+            if (g.scale.x < 0.0001) { return; }
+
             let pos = g.pos.xyz;
             let iter = f32(uniforms.trainIter);
 
@@ -127,6 +130,9 @@
             
             if (searchIdx != idx && searchIdx < uniforms.numGaussians) {
                 let neighbor = gaussians[searchIdx];
+                // Skip neighbor if it is invalid (scale ~ 0)
+                if (neighbor.scale.x < 0.0001) { return; }
+
                 let diff = neighbor.pos.xyz - pos;
                 let distSq = dot(diff, diff);
                 
@@ -194,6 +200,9 @@
             if (idx >= uniforms.paddedCount) { return; }
             if (idx >= uniforms.numGaussians) { sortKeys[idx] = -9999999.0; sortIndices[idx] = idx; return; }
             let g = gaussians[idx];
+            // If scale is 0 (invalid), push to back
+            if (g.scale.x < 0.0001) { sortKeys[idx] = -9999999.0; sortIndices[idx] = idx; return; }
+            
             let pos = vec4<f32>(g.pos.xyz, 1.0);
             let viewPos = uniforms.viewMatrix * pos;
             sortKeys[idx] = viewPos.z; sortIndices[idx] = idx;
@@ -210,7 +219,7 @@
             if (ixj > i && ixj < uniforms.paddedCount) {
                 let key_i = sortKeys[i]; let key_ixj = sortKeys[ixj];
                 let dir = (i & k) == 0u;
-                // Back-to-Front Logic (ViewZ is negative forward usually, but here we assume standard)
+                // Back-to-Front Logic
                 if ((key_i > key_ixj) == dir) {
                     sortKeys[i] = key_ixj; sortKeys[ixj] = key_i;
                     let tempIdx = sortIndices[i]; sortIndices[i] = sortIndices[ixj]; sortIndices[ixj] = tempIdx;
@@ -237,6 +246,10 @@
             var out: VertexOutput;
             if (i_index >= uniforms.numGaussians) { out.position = vec4<f32>(0.0); return out; }
             let g = gaussians[sortIndices[i_index]];
+            
+            // Check for culled/invalid Gaussian (scale=0)
+            if (g.scale.x < 0.0001) { out.position = vec4<f32>(0.0,0.0,2.0,1.0); return out; }
+
             let center = vec4<f32>(g.pos.xyz, 1.0);
             let viewPos = uniforms.viewMatrix * center;
             // Near clipping
@@ -251,7 +264,10 @@
             let f_z = f / viewPos.z; let txtz = f_z * f_z;
             let cov2d_00 = Sigma_view[0][0] * txtz; let cov2d_01 = Sigma_view[0][1] * txtz; let cov2d_11 = Sigma_view[1][1] * txtz;
             let det = cov2d_00 * cov2d_11 - cov2d_01 * cov2d_01;
-            if (det <= 0.000001) { out.position = vec4<f32>(0.0,0.0,2.0,1.0); return out; }
+            
+            // FIX: Inverse logic to catch NaNs. If det is NaN, (det > 0.0) is false, so !(false) is true -> return.
+            if (!(det > 0.000001)) { out.position = vec4<f32>(0.0,0.0,2.0,1.0); return out; }
+            
             let det_inv = 1.0 / det;
             out.conic = vec3<f32>(cov2d_11 * det_inv, -cov2d_01 * det_inv, cov2d_00 * det_inv);
             let mid = 0.5 * (cov2d_00 + cov2d_11);
@@ -312,7 +328,10 @@
             },
             lookAt: (out, eye, center, up) => {
                 let z0 = eye[0]-center[0], z1 = eye[1]-center[1], z2 = eye[2]-center[2];
-                let len = 1/Math.hypot(z0,z1,z2); z0*=len; z1*=len; z2*=len;
+                let len = 1/Math.hypot(z0,z1,z2); 
+                // Fix: NaN check for camera vector
+                if (!Number.isFinite(len)) len = 1;
+                z0*=len; z1*=len; z2*=len;
                 let x0 = up[1]*z2 - up[2]*z1, x1 = up[2]*z0 - up[0]*z2, x2 = up[0]*z1 - up[1]*z0;
                 len = Math.hypot(x0,x1,x2); if(!len) len=1; len=1/len; x0*=len; x1*=len; x2*=len;
                 let y0 = z1*x2 - z2*x1, y1 = z2*x0 - z0*x2, y2 = z0*x1 - z1*x0;
@@ -385,6 +404,12 @@
             ui.trainBtn.innerText = "Start Geometric Training";
             ui.bar.style.width = '10%'; ui.status.innerText = "Reading file...";
 
+            // NaN Sanitizer Helper
+            const sanitize = (val, fallback = 0.0) => {
+                if (Number.isNaN(val) || !Number.isFinite(val)) return fallback;
+                return val;
+            };
+
             try {
                 const chunk = await file.slice(0, 4096).text();
                 const endHeaderMatch = chunk.match(/end_header\s*\n/);
@@ -428,6 +453,8 @@
                 const hasScale = getP('scale_0');
                 
                 let loadedIdx = 0;
+                let nanCount = 0;
+
                 if (isBinary) {
                     let stride = 0; props.forEach(p => { p.offset = stride; stride += p.size; });
                     const buffer = await file.slice(headerSize).arrayBuffer();
@@ -435,19 +462,35 @@
                     for(let i=0; i<vertexCount; i+=skipStep) {
                         if(loadedIdx>=loadCount) break;
                         const base = i*stride; const gb = loadedIdx*16;
-                        gpuData[gb+0] = view.getFloat32(base + getP('x').offset, true);
-                        gpuData[gb+1] = view.getFloat32(base + getP('y').offset, true);
-                        gpuData[gb+2] = view.getFloat32(base + getP('z').offset, true);
+                        
+                        let x = view.getFloat32(base + getP('x').offset, true);
+                        let y = view.getFloat32(base + getP('y').offset, true);
+                        let z = view.getFloat32(base + getP('z').offset, true);
+
+                        // === NaN CHECK & SANITIZATION ===
+                        let invalid = false;
+                        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+                            x = 0; y = 0; z = 0; 
+                            invalid = true;
+                            nanCount++;
+                        }
+                        
+                        gpuData[gb+0] = x;
+                        gpuData[gb+1] = y;
+                        gpuData[gb+2] = z;
                         gpuData[gb+3] = 0.5; // Low opacity
                         
-                        const s = hasScale ? Math.exp(view.getFloat32(base+getP('scale_0').offset,true)) : 0.01;
+                        // If invalid, set scale to 0 to hide it
+                        let s = hasScale ? Math.exp(sanitize(view.getFloat32(base+getP('scale_0').offset,true), -10.0)) : 0.01;
+                        if (invalid || !Number.isFinite(s)) s = 0.0; 
+
                         gpuData[gb+4]=s; gpuData[gb+5]=s; gpuData[gb+6]=s;
                         gpuData[gb+8]=1.0; 
                         
                         if(hasRGB) {
-                            gpuData[gb+12] = view.getUint8(base+getP('red').offset)/255.0;
-                            gpuData[gb+13] = view.getUint8(base+getP('green').offset)/255.0;
-                            gpuData[gb+14] = view.getUint8(base+getP('blue').offset)/255.0;
+                            gpuData[gb+12] = sanitize(view.getUint8(base+getP('red').offset)/255.0);
+                            gpuData[gb+13] = sanitize(view.getUint8(base+getP('green').offset)/255.0);
+                            gpuData[gb+14] = sanitize(view.getUint8(base+getP('blue').offset)/255.0);
                         } else { gpuData[gb+12]=0.8; gpuData[gb+13]=0.8; gpuData[gb+14]=0.8; }
                         gpuData[gb+15]=1.0;
                         loadedIdx++;
@@ -464,19 +507,40 @@
                         if(loadedIdx>=loadCount) break;
                         const parts = line.split(/\s+/);
                         const gb = loadedIdx*16;
-                        gpuData[gb+0]=parseFloat(parts[getP('x').index]);
-                        gpuData[gb+1]=parseFloat(parts[getP('y').index]);
-                        gpuData[gb+2]=parseFloat(parts[getP('z').index]);
-                        gpuData[gb+3]=0.5;
-                        gpuData[gb+4]=0.01; gpuData[gb+5]=0.01; gpuData[gb+6]=0.01;
+                        
+                        let x = parseFloat(parts[getP('x').index]);
+                        let y = parseFloat(parts[getP('y').index]);
+                        let z = parseFloat(parts[getP('z').index]);
+                        
+                        // === NaN CHECK & SANITIZATION ===
+                        let invalid = false;
+                        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+                            x = 0; y = 0; z = 0; 
+                            invalid = true;
+                            nanCount++;
+                        }
+
+                        gpuData[gb+0] = x;
+                        gpuData[gb+1] = y;
+                        gpuData[gb+2] = z;
+                        gpuData[gb+3] = 0.5;
+                        
+                        let s = 0.01;
+                        if (invalid) s = 0.0;
+                        
+                        gpuData[gb+4]=s; gpuData[gb+5]=s; gpuData[gb+6]=s;
                         gpuData[gb+8]=1.0;
                         if(hasRGB) {
-                            gpuData[gb+12]=parseFloat(parts[getP('red').index])/255;
-                            gpuData[gb+13]=parseFloat(parts[getP('green').index])/255;
-                            gpuData[gb+14]=parseFloat(parts[getP('blue').index])/255;
+                            gpuData[gb+12]=sanitize(parseFloat(parts[getP('red').index])/255);
+                            gpuData[gb+13]=sanitize(parseFloat(parts[getP('green').index])/255);
+                            gpuData[gb+14]=sanitize(parseFloat(parts[getP('blue').index])/255);
                         } else { gpuData[gb+12]=0.8; gpuData[gb+13]=0.8; gpuData[gb+14]=0.8; }
                         loadedIdx++; rawIdx++;
                     }
+                }
+
+                if (nanCount > 0) {
+                    ui.status.innerText += `\nWarning: Removed ${nanCount} invalid points (NaN/Inf).`;
                 }
 
                 ui.bar.style.width = '100%';
