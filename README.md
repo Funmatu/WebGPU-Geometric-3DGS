@@ -12,23 +12,26 @@
 
 ## 📖 Overview
 
-This project is a high-performance **WebGPU implementation of 3D Gaussian Splatting (3DGS)** designed to work with sparse point cloud data (e.g., from **ZED2i**, **RTAB-map**, or standard `.ply` files).
+This project is a high-performance **WebGPU implementation of Geometric Gaussian Splatting**, designed to work with sparse point cloud data (e.g., from **ZED2i**, **RTAB-map**, or standard `.ply` files).
 
-Unlike standard 3DGS training which requires hundreds of images and minutes of offline training (CUDA), this renderer implements a **"Geometric Training"** phase that runs entirely on the GPU in real-time. It analyzes the spatial distribution of neighbors for each point to estimate scale, rotation, and opacity, turning a sparse point cloud into a continuous, splatted surface instantly.
+Unlike the standard 3DGS which optimizes parameters from multi-view images (photometric loss), this renderer performs **Blind Estimation of Gaussian Covariance directly from geometry**. It analyzes the spatial distribution of neighbors for each point to estimate scale, rotation, and opacity without any reference images, turning a sparse point cloud into a continuous surface in real-time.
+
+
 
 ## ✨ Key Features
 
-* **WebGPU Compute Pipelines**: All logic (Sorting, Training, Rasterization) runs on the GPU.
-* **Geometric Training (Blind Estimation)**:
-    * Estimates 3DGS parameters (Covariance: Scale & Rotation) *without* reference images.
-    * Uses stochastic neighbor search and iterative plane fitting to align splats with surface geometry.
+* **Image-Free Geometric Training**:
+    * **Blind Estimation**: Estimates 3DGS parameters (Covariance: Scale & Rotation) strictly from point cloud geometry, **without reference images**.
+    * **Stochastic Optimization**: Uses stochastic neighbor search and iterative plane fitting to align splats with the underlying surface geometry.
+* **WebGPU Compute Pipelines**: 
+    * All heavy-duty logic (Sorting, Geometric Training, and Rasterization) runs entirely on the GPU.
 * **Optimized Bitonic Sort**:
     * Implements a fully parallel GPU Bitonic Sort.
     * Utilizes **Dynamic Offsets** to batch sort commands, reducing CPU-GPU communication overhead by ~99% compared to naive implementations.
 * **Universal PLY Loader**:
     * Auto-detects Binary/ASCII formats.
     * Auto-fills missing 3DGS attributes (Scale/Rot/Opacity) for standard Point Clouds.
-    * Auto-downsamples massive files to fit your GPU limits.
+    * Auto-downsamples massive files to fit your GPU memory limits.
 
 ## 🛠️ Technology Stack
 
